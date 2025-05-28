@@ -1,14 +1,28 @@
 package com.hccps.xiao.itemdector.sondar.echotest;
 
-
+import android.content.Context;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.util.Log;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.ShortBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -16,14 +30,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class EchoTester {
     private static final String TAG = "EchoTester";
 
-    // Audio configuration - based on Phase 1 findings
+    // Audio configuration
     private static final int SAMPLE_RATE = 48000; // Hz
-    private static final int CHIRP_MIN_FREQ = 18000; // Hz
-    private static final int CHIRP_MAX_FREQ = 22000; // Hz
-    private static final int CHIRP_DURATION_MS = 20; // ms
-    private static final int CHIRP_GAP_MS = 500; // ms between chirps
+    private static final int CHIRP_MIN_FREQ = 15000; // Hz
+    private static final int CHIRP_MAX_FREQ = 17000; // Hz
+    private static final int CHIRP_DURATION_MS = 15; // ms
+    private static final int CHIRP_GAP_MS = 400; // ms between chirps
     private static final int BUFFER_SIZE = SAMPLE_RATE / 10; // 100ms buffer
-    private static final int TEST_DURATION_MS = 5000; // 5 seconds test
+    private static final int TEST_DURATION_MS = 10000; // 10 seconds test
 
     // Detection thresholds
     private static final double ECHO_THRESHOLD = 40; // Minimum energy for echo detection
@@ -39,11 +53,33 @@ public class EchoTester {
     private ExecutorService executor;
     private EchoTestCallback callback;
 
+    // Data collection
+    private List<ChirpData> chirpDataList = new ArrayList<>();
+    private List<short[]> allRecordings = new ArrayList<>();
+    private List<Long> chirpTimes = new ArrayList<>();
+    private String sessionId;
+    private boolean saveRawData = true;
+    private File outputDirectory;
+    private Context context;
+
+    // Metadata for the session
+    private JSONObject sessionMetadata = new JSONObject();
+
     // Constructor
-    public EchoTester() {
+    public EchoTester(Context context) {
+        this.context = context;
         executor = Executors.newSingleThreadExecutor();
         initAudio();
+
+        // Create session ID first, then setup directories
+        createSessionId();
+        setupOutputDirectory();
+
+        // Generate chirp template after directory is set up
         generateChirpTemplate();
+
+        // Initialize metadata
+        initSessionMetadata();
     }
 
     // Initialize audio components
@@ -106,6 +142,69 @@ public class EchoTester {
         }
     }
 
+    private void createSessionId() {
+        // Create a unique session ID using timestamp
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US);
+        sessionId = "echo_test_" + sdf.format(new Date());
+    }
+
+    // Modified setupOutputDirectory method prioritizing internal storage
+
+    private void setupOutputDirectory() {
+        try {
+            // Use internal app storage as primary option (like SondarDataCollector)
+            File baseDir = new File(context.getFilesDir(), "EchoTest");
+            if (!baseDir.exists()) {
+                boolean success = baseDir.mkdirs();
+                if (!success) {
+                    Log.e(TAG, "Failed to create base directory: " + baseDir.getAbsolutePath());
+                }
+            }
+
+            // Create session directory
+            outputDirectory = new File(baseDir, sessionId);
+            Log.d(TAG, "Attempting to create directory: " + outputDirectory.getAbsolutePath());
+
+            if (!outputDirectory.exists()) {
+                boolean success = outputDirectory.mkdirs();
+                if (!success) {
+                    Log.e(TAG, "Failed to create output directory: " + outputDirectory.getAbsolutePath());
+                }
+            }
+
+            Log.d(TAG, "Output directory: " + outputDirectory.getAbsolutePath());
+        } catch (Exception e) {
+            Log.e(TAG, "Error setting up output directory", e);
+            // Create a temporary fallback in cache directory
+            outputDirectory = new File(context.getCacheDir(), "EchoTest/" + sessionId);
+            try {
+                if (!outputDirectory.exists() && !outputDirectory.mkdirs()) {
+                    Log.e(TAG, "Failed to create fallback directory");
+                }
+            } catch (Exception e2) {
+                Log.e(TAG, "Failed to create even the fallback directory", e2);
+            }
+        }
+    }
+
+    private void initSessionMetadata() {
+        try {
+            sessionMetadata.put("sessionId", sessionId);
+            sessionMetadata.put("testStartTime", System.currentTimeMillis());
+            sessionMetadata.put("sampleRate", SAMPLE_RATE);
+            sessionMetadata.put("chirpMinFreq", CHIRP_MIN_FREQ);
+            sessionMetadata.put("chirpMaxFreq", CHIRP_MAX_FREQ);
+            sessionMetadata.put("chirpDurationMs", CHIRP_DURATION_MS);
+            sessionMetadata.put("chirpGapMs", CHIRP_GAP_MS);
+            sessionMetadata.put("bufferSize", BUFFER_SIZE);
+            sessionMetadata.put("testDurationMs", TEST_DURATION_MS);
+            sessionMetadata.put("deviceModel", android.os.Build.MODEL);
+            sessionMetadata.put("androidVersion", android.os.Build.VERSION.RELEASE);
+        } catch (JSONException e) {
+            Log.e(TAG, "Error creating session metadata", e);
+        }
+    }
+
     // Generate chirp signal
     private void generateChirpTemplate() {
         int chirpSamples = (int) (SAMPLE_RATE * CHIRP_DURATION_MS / 1000.0);
@@ -139,6 +238,53 @@ public class EchoTester {
 
         Log.d(TAG, String.format("Chirp generated: %d samples, %.2f ms, %d-%d Hz, amplitude range: %d to %d",
                 chirpSamples, (float)CHIRP_DURATION_MS, CHIRP_MIN_FREQ, CHIRP_MAX_FREQ, minVal, maxVal));
+
+        // Save chirp template
+        saveChirpTemplate();
+    }
+
+    private void saveChirpTemplate() {
+        try {
+            // Make sure directory exists
+            if (!outputDirectory.exists()) {
+                if (!outputDirectory.mkdirs()) {
+                    Log.e(TAG, "Failed to create output directory: " + outputDirectory.getAbsolutePath());
+                    return;
+                }
+            }
+
+            // Create file in the directory
+            File chirpFile = new File(outputDirectory, "chirp_template.raw");
+            Log.d(TAG, "Saving chirp template to: " + chirpFile.getAbsolutePath());
+
+            // Simplified and safer file writing
+            try (FileOutputStream fos = new FileOutputStream(chirpFile);
+                 DataOutputStream dos = new DataOutputStream(fos)) {
+
+                // Write each sample
+                for (short sample : chirpTemplate) {
+                    dos.writeShort(sample);
+                }
+
+                Log.d(TAG, "Chirp template saved successfully");
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to save chirp template: " + e.getMessage(), e);
+            // Continue execution even if file save fails
+        }
+    }
+
+    // Configuration methods
+    public void setSaveRawData(boolean saveRawData) {
+        this.saveRawData = saveRawData;
+    }
+
+    public void setTestDuration(int durationMs) {
+        try {
+            sessionMetadata.put("testDurationMs", durationMs);
+        } catch (JSONException e) {
+            Log.e(TAG, "Error updating test duration in metadata", e);
+        }
     }
 
     // Start echo detection test
@@ -150,6 +296,11 @@ public class EchoTester {
 
         this.callback = callback;
         isRunning.set(true);
+
+        // Create new lists for this test
+        chirpDataList.clear();
+        allRecordings.clear();
+        chirpTimes.clear();
 
         executor.execute(() -> {
             try {
@@ -163,12 +314,30 @@ public class EchoTester {
                 audioRecord.startRecording();
                 audioTrack.play();
 
-                List<short[]> allRecordings = new ArrayList<>();
-                List<Long> chirpTimes = new ArrayList<>();
-
                 long startTime = System.currentTimeMillis();
                 long testEndTime = startTime + TEST_DURATION_MS;
                 long nextChirpTime = startTime;
+
+                try {
+                    sessionMetadata.put("actualStartTime", startTime);
+                } catch (JSONException e) {
+                    Log.e(TAG, "Error updating metadata", e);
+                }
+
+                // Create raw audio file to save all recorded samples
+                File rawAudioFile = null;
+                DataOutputStream rawAudioStream = null;
+
+                if (saveRawData) {
+                    try {
+                        rawAudioFile = new File(outputDirectory, "raw_recording.pcm");
+                        rawAudioStream = new DataOutputStream(new BufferedOutputStream(
+                                new FileOutputStream(rawAudioFile)));
+                    } catch (IOException e) {
+                        Log.e(TAG, "Failed to create raw audio file", e);
+                        rawAudioStream = null;
+                    }
+                }
 
                 while (isRunning.get() && System.currentTimeMillis() < testEndTime) {
                     long currentTime = System.currentTimeMillis();
@@ -177,11 +346,18 @@ public class EchoTester {
 
                     // Time to emit a chirp?
                     if (currentTime >= nextChirpTime) {
-                        Log.d(TAG, "Emitting chirp at " + (currentTime - startTime) + "ms");
+                        long emitTime = System.currentTimeMillis();
+                        Log.d(TAG, "Emitting chirp at " + (emitTime - startTime) + "ms");
 
                         // Play chirp
                         audioTrack.write(chirpTemplate, 0, chirpTemplate.length);
-                        chirpTimes.add(currentTime);
+                        chirpTimes.add(emitTime);
+
+                        // Create chirp data object
+                        ChirpData chirpData = new ChirpData();
+                        chirpData.timestamp = emitTime;
+                        chirpData.emitTimeFromStart = emitTime - startTime;
+                        chirpDataList.add(chirpData);
 
                         // Schedule next chirp
                         nextChirpTime = currentTime + CHIRP_GAP_MS;
@@ -189,12 +365,30 @@ public class EchoTester {
 
                     // Read audio data
                     short[] buffer = new short[BUFFER_SIZE];
-                    int bytesRead = audioRecord.read(buffer, 0, BUFFER_SIZE);
+                    int samplesRead = audioRecord.read(buffer, 0, BUFFER_SIZE);
 
-                    if (bytesRead > 0) {
-                        short[] recording = new short[bytesRead];
-                        System.arraycopy(buffer, 0, recording, 0, bytesRead);
+                    if (samplesRead > 0) {
+                        short[] recording = new short[samplesRead];
+                        System.arraycopy(buffer, 0, recording, 0, samplesRead);
                         allRecordings.add(recording);
+
+                        // Save raw audio data
+                        if (saveRawData && rawAudioStream != null) {
+                            try {
+                                for (int i = 0; i < samplesRead; i++) {
+                                    rawAudioStream.writeShort(recording[i]);
+                                }
+                            } catch (IOException e) {
+                                Log.e(TAG, "Error writing to raw audio file", e);
+                                // Close and nullify to prevent further attempts
+                                try {
+                                    rawAudioStream.close();
+                                } catch (IOException e2) {
+                                    // Ignore
+                                }
+                                rawAudioStream = null;
+                            }
+                        }
 
                         // Log signal stats for debugging
                         logSignalStats(recording);
@@ -209,9 +403,32 @@ public class EchoTester {
                     }
                 }
 
+                // Close raw audio file
+                if (rawAudioStream != null) {
+                    try {
+                        rawAudioStream.close();
+                        Log.d(TAG, "Raw audio saved to " + rawAudioFile.getAbsolutePath());
+                    } catch (IOException e) {
+                        Log.e(TAG, "Error closing raw audio file", e);
+                    }
+                }
+
                 // Stop recording
+                long endTime = System.currentTimeMillis();
                 audioRecord.stop();
                 audioTrack.stop();
+
+                try {
+                    sessionMetadata.put("actualEndTime", endTime);
+                    sessionMetadata.put("actualDuration", endTime - startTime);
+                    sessionMetadata.put("chirpCount", chirpTimes.size());
+                } catch (JSONException e) {
+                    Log.e(TAG, "Error updating metadata", e);
+                }
+
+                // Save metadata and chirp timing data
+                saveSessionMetadata();
+                saveChirpTimingData();
 
                 // Process results
                 TestResult result = analyzeRecordings(allRecordings, chirpTimes);
@@ -227,6 +444,145 @@ public class EchoTester {
             }
         });
     }
+
+    private void saveSessionMetadata() {
+        try {
+            File metadataFile = new File(outputDirectory, "session_metadata.json");
+            FileOutputStream fos = new FileOutputStream(metadataFile);
+            fos.write(sessionMetadata.toString(4).getBytes());
+            fos.close();
+            Log.d(TAG, "Session metadata saved to " + metadataFile.getAbsolutePath());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save session metadata", e);
+            // Continue execution even if file save fails
+        }
+    }
+
+    private void saveChirpTimingData() {
+        try {
+            File chirpTimingFile = new File(outputDirectory, "chirp_timing.csv");
+            FileOutputStream fos = new FileOutputStream(chirpTimingFile);
+
+            // Write header
+            fos.write("chirp_index,timestamp,time_from_start_ms\n".getBytes());
+
+            // Write chirp timing data
+            for (int i = 0; i < chirpDataList.size(); i++) {
+                ChirpData chirpData = chirpDataList.get(i);
+                String line = i + "," + chirpData.timestamp + "," + chirpData.emitTimeFromStart + "\n";
+                fos.write(line.getBytes());
+            }
+
+            fos.close();
+            Log.d(TAG, "Chirp timing data saved to " + chirpTimingFile.getAbsolutePath());
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to save chirp timing data", e);
+            // Continue execution even if file save fails
+        }
+    }
+
+    public void saveRawDataAsCsv() {
+        try {
+            File rawDataCsv = new File(outputDirectory, "raw_data.csv");
+            FileOutputStream fos = new FileOutputStream(rawDataCsv);
+
+            // Write header
+            fos.write("sample_index,value\n".getBytes());
+
+            // Write all samples
+            int sampleIndex = 0;
+            for (short[] recording : allRecordings) {
+                for (short sample : recording) {
+                    String line = sampleIndex + "," + sample + "\n";
+                    fos.write(line.getBytes());
+                    sampleIndex++;
+                }
+            }
+
+            fos.close();
+            Log.d(TAG, "Raw data saved as CSV to " + rawDataCsv.getAbsolutePath());
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to save raw data as CSV", e);
+            // Continue execution even if file save fails
+        }
+    }
+
+    public void exportDataAsWav() {
+        try {
+            // Calculate total number of samples
+            int totalSamples = 0;
+            for (short[] recording : allRecordings) {
+                totalSamples += recording.length;
+            }
+
+            // Create buffer for all samples
+            short[] allSamples = new short[totalSamples];
+            int position = 0;
+            for (short[] recording : allRecordings) {
+                System.arraycopy(recording, 0, allSamples, position, recording.length);
+                position += recording.length;
+            }
+
+            // Write WAV file
+            File wavFile = new File(outputDirectory, "recording.wav");
+            writeWavFile(wavFile, allSamples, SAMPLE_RATE);
+            Log.d(TAG, "WAV file saved to " + wavFile.getAbsolutePath());
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to export data as WAV", e);
+            // Continue execution even if file save fails
+        }
+    }
+
+    private void writeWavFile(File outputFile, short[] samples, int sampleRate) throws IOException {
+        // Create output streams
+        FileOutputStream fos = new FileOutputStream(outputFile);
+        BufferedOutputStream bos = new BufferedOutputStream(fos);
+        DataOutputStream dos = new DataOutputStream(bos);
+
+        try {
+            // Calculate sizes
+            int dataSize = samples.length * 2;  // 16-bit audio = 2 bytes per sample
+            int fileSize = 36 + dataSize;
+
+            // RIFF header
+            writeString(dos, "RIFF");            // ChunkID
+            dos.writeInt(fileSize);              // ChunkSize
+            writeString(dos, "WAVE");            // Format
+
+            // fmt subchunk
+            writeString(dos, "fmt ");            // Subchunk1ID
+            dos.writeInt(16);                    // Subchunk1Size (16 for PCM)
+            dos.writeShort(1);                   // AudioFormat (1 = PCM)
+            dos.writeShort(1);                   // NumChannels (1 = mono)
+            dos.writeInt(sampleRate);            // SampleRate
+            dos.writeInt(sampleRate * 2);        // ByteRate = SampleRate * NumChannels * BitsPerSample/8
+            dos.writeShort(2);                   // BlockAlign = NumChannels * BitsPerSample/8
+            dos.writeShort(16);                  // BitsPerSample
+
+            // data subchunk
+            writeString(dos, "data");            // Subchunk2ID
+            dos.writeInt(dataSize);              // Subchunk2Size
+
+            // Write the audio samples
+            // DataOutputStream.writeShort() writes in big-endian,
+            // but WAV needs little-endian, so we need to swap bytes
+            for (short sample : samples) {
+                // Write little-endian short
+                dos.writeByte(sample & 0xFF);         // Low byte
+                dos.writeByte((sample >> 8) & 0xFF);  // High byte
+            }
+        } finally {
+            dos.close();
+        }
+    }
+
+    // Helper method to write a string to the output stream
+    private void writeString(DataOutputStream out, String s) throws IOException {
+        for (int i = 0; i < s.length(); i++) {
+            out.writeByte(s.charAt(i));
+        }
+    }
+
 
     // Stop the current test
     public void stopTest() {
@@ -430,10 +786,62 @@ public class EchoTester {
             }
         }
 
+        // Save analysis results
+        saveAnalysisResults(result, echoEnergies, noiseEnergies, echoDelays);
+
         Log.i(TAG, String.format("Analysis complete: echoes=%b, energy=%.2f, SNR=%.2f dB, count=%d",
                 result.echoDetected, result.signalEnergy, result.snr, result.echoCount));
 
         return result;
+    }
+
+    private void saveAnalysisResults(TestResult result, List<Double> echoEnergies,
+                                     List<Double> noiseEnergies, List<Double> echoDelays) {
+        try {
+            // Save summary results
+            JSONObject analysisResults = new JSONObject();
+            analysisResults.put("echoDetected", result.echoDetected);
+            analysisResults.put("signalQuality", result.signalQuality);
+            analysisResults.put("signalEnergy", result.signalEnergy);
+            analysisResults.put("snr", result.snr);
+            analysisResults.put("peakAmplitude", result.peakAmplitude);
+            analysisResults.put("echoDelayMs", result.echoDelayMs);
+            analysisResults.put("echoCount", result.echoCount);
+            analysisResults.put("minValue", result.minValue);
+            analysisResults.put("maxValue", result.maxValue);
+            analysisResults.put("meanValue", result.meanValue);
+            analysisResults.put("rmsValue", result.rmsValue);
+
+            File analysisFile = new File(outputDirectory, "analysis_results.json");
+            FileOutputStream fos = new FileOutputStream(analysisFile);
+            fos.write(analysisResults.toString(4).getBytes());
+            fos.close();
+
+            // Save detailed chirp analysis
+            File detailedFile = new File(outputDirectory, "detailed_analysis.csv");
+            FileOutputStream detailedFos = new FileOutputStream(detailedFile);
+
+            // Write header
+            detailedFos.write("chirp_index,echo_energy,noise_energy,echo_delay_ms\n".getBytes());
+
+            // Write detailed data
+            int numChirps = Math.min(chirpTimes.size(),
+                    Math.min(echoEnergies.size(),
+                            Math.min(noiseEnergies.size(), echoDelays.size())));
+
+            for (int i = 0; i < numChirps; i++) {
+                String line = i + "," + echoEnergies.get(i) + "," +
+                        noiseEnergies.get(i) + "," + echoDelays.get(i) + "\n";
+                detailedFos.write(line.getBytes());
+            }
+
+            detailedFos.close();
+
+            Log.d(TAG, "Analysis results saved to " + outputDirectory.getAbsolutePath());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save analysis results", e);
+            // Continue execution even if file save fails
+        }
     }
 
     // Calculate energy of signal in a range
@@ -460,6 +868,12 @@ public class EchoTester {
         return peakIndex;
     }
 
+    // Helper class to store chirp data
+    private static class ChirpData {
+        long timestamp;        // System time when chirp was emitted
+        long emitTimeFromStart; // Time from test start when chirp was emitted
+    }
+
     // Echo test callback interface
     public interface EchoTestCallback {
         void onProgress(int percentComplete);
@@ -480,5 +894,10 @@ public class EchoTester {
         public short maxValue = 0;
         public double meanValue = 0;
         public double rmsValue = 0;
+    }
+
+    // Get the session directory path
+    public String getSessionDirectoryPath() {
+        return outputDirectory.getAbsolutePath();
     }
 }

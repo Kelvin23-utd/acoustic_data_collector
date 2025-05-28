@@ -1,50 +1,64 @@
 package com.hccps.xiao.itemdector.sondar.echotest;
 
 import android.Manifest;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ProgressBar;
-import android.widget.TextView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
-
 public class EchoTestActivity extends AppCompatActivity {
     private static final String TAG = "EchoTest";
     private static final int PERMISSION_REQUEST_CODE = 101;
-    private static final int AUTO_TEST_COUNT = 10;
+
+    // Required permissions
+    private static final String[] REQUIRED_PERMISSIONS = {
+            Manifest.permission.RECORD_AUDIO,
+            // No storage permissions needed when using internal storage
+    };
 
     // UI Components
     private Button testButton;
-    private Button autoTestButton;
+    private Button exportButton;
     private TextView statusText;
     private TextView resultText;
     private ProgressBar progressBar;
-    private ScrollView scrollView;
+    private ScrollView resultScrollView;
+    private RadioGroup testModeGroup;
+    private RadioButton standardTestRadio;
+    private RadioButton dataCollectionRadio;
+    private SeekBar durationSeekBar;
+    private TextView durationValueText;
 
     // Test Components
     private EchoTester echoTester;
     private boolean isRunningTest = false;
-    private boolean isRunningAutoTest = false;
     private Handler mainHandler;
-
-    // Auto-test variables
-    private int currentAutoTestNumber = 0;
-    private List<EchoTester.TestResult> autoTestResults = new ArrayList<>();
-    private StringBuilder resultsBuilder = new StringBuilder();
+    private String lastSessionPath = null;
+    private int testDurationMs = 10000; // Default 10 seconds
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -53,15 +67,41 @@ public class EchoTestActivity extends AppCompatActivity {
 
         // Initialize UI components
         testButton = findViewById(R.id.test_button);
-        autoTestButton = findViewById(R.id.auto_test_button);
+        exportButton = findViewById(R.id.export_button);
         statusText = findViewById(R.id.status_text);
         resultText = findViewById(R.id.result_text);
         progressBar = findViewById(R.id.progress_bar);
+        resultScrollView = findViewById(R.id.result_scroll_view);
+        testModeGroup = findViewById(R.id.test_mode_group);
+        standardTestRadio = findViewById(R.id.standard_test_radio);
+        dataCollectionRadio = findViewById(R.id.data_collection_radio);
+        durationSeekBar = findViewById(R.id.duration_seek_bar);
+        durationValueText = findViewById(R.id.duration_value_text);
+
+        // Set up duration seek bar
+        durationSeekBar.setMax(30); // Max 30 seconds
+        durationSeekBar.setProgress(10); // Default 10 seconds
+        updateDurationText(10);
+
+        durationSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int duration = Math.max(1, progress); // Minimum 1 second
+                updateDurationText(duration);
+                testDurationMs = duration * 1000;
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
 
         // Initialize handler for UI updates
         mainHandler = new Handler(Looper.getMainLooper());
 
-        // Set up single test button click listener
+        // Set up button click listeners
         testButton.setOnClickListener(v -> {
             if (isRunningTest) {
                 stopTest();
@@ -70,30 +110,32 @@ public class EchoTestActivity extends AppCompatActivity {
             }
         });
 
-        // Set up auto test button click listener
-        autoTestButton.setOnClickListener(v -> {
-            if (isRunningAutoTest) {
-                stopAutoTest();
-            } else {
-                startAutoTest();
-            }
+        exportButton.setOnClickListener(v -> {
+            exportLastSession();
         });
 
-        // Create the echo tester
-        echoTester = new EchoTester();
+        // Initially disable export button
+        exportButton.setEnabled(false);
+
+        // Initialize tester with application context
+        echoTester = new EchoTester(getApplicationContext());
 
         // Check for required permissions
-        if (!hasPermissions()) {
+        if (!hasAllPermissions()) {
             requestPermissions();
-            statusText.setText("Waiting for microphone permission");
+            statusText.setText("Waiting for required permissions");
         } else {
             statusText.setText("Ready to test echo detection");
         }
     }
 
-    private boolean hasPermissions() {
-        return ContextCompat.checkSelfPermission(this,
-                Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    private void updateDurationText(int seconds) {
+        durationValueText.setText(String.format(Locale.US, "%d seconds", seconds));
+    }
+
+    private boolean hasAllPermissions() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestPermissions() {
@@ -106,30 +148,43 @@ public class EchoTestActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            boolean allGranted = true;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+
+            if (allGranted) {
                 statusText.setText("Ready to test echo detection");
                 testButton.setEnabled(true);
-                autoTestButton.setEnabled(true);
             } else {
-                statusText.setText("Microphone permission required");
+                statusText.setText("All permissions required for testing");
                 testButton.setEnabled(false);
-                autoTestButton.setEnabled(false);
+                Toast.makeText(this, "Permissions are required for the app to function", Toast.LENGTH_LONG).show();
             }
         }
     }
 
     private void startTest() {
-        if (!hasPermissions()) {
+        if (!hasAllPermissions()) {
             requestPermissions();
             return;
         }
 
         isRunningTest = true;
         testButton.setText("Stop Test");
-        autoTestButton.setEnabled(false);
         statusText.setText("Running echo detection test...");
         resultText.setText("");
+        progressBar.setProgress(0);
         progressBar.setVisibility(View.VISIBLE);
+        exportButton.setEnabled(false);
+
+        // Configure test mode
+        boolean isDataCollectionMode = dataCollectionRadio.isChecked();
+        echoTester.setSaveRawData(true); // Always save raw data
+        echoTester.setTestDuration(testDurationMs);
 
         // Start the echo test
         echoTester.startTest(new EchoTester.EchoTestCallback() {
@@ -147,8 +202,36 @@ public class EchoTestActivity extends AppCompatActivity {
                     progressBar.setVisibility(View.INVISIBLE);
                     statusText.setText("Test completed");
 
-                    // Display the results
-                    String resultStr = String.format(
+                    // Save session path for export
+                    lastSessionPath = echoTester.getSessionDirectoryPath();
+
+                    // Enable export button
+                    exportButton.setEnabled(true);
+
+                    // Export data as WAV for easier processing
+                    echoTester.exportDataAsWav();
+
+                    StringBuilder resultBuilder = new StringBuilder();
+
+                    // Show file paths if in data collection mode
+                    if (isDataCollectionMode) {
+                        resultBuilder.append("Data Collection Complete\n\n");
+                        resultBuilder.append("Files saved to:\n");
+                        resultBuilder.append(lastSessionPath).append("\n\n");
+                        resultBuilder.append("Files:\n");
+                        resultBuilder.append("- raw_recording.pcm (Binary PCM data)\n");
+                        resultBuilder.append("- recording.wav (WAV format audio)\n");
+                        resultBuilder.append("- chirp_template.raw (Binary chirp data)\n");
+                        resultBuilder.append("- session_metadata.json (Test parameters)\n");
+                        resultBuilder.append("- chirp_timing.csv (Chirp timestamps)\n");
+                        resultBuilder.append("- analysis_results.json (Basic analysis)\n");
+                        resultBuilder.append("- detailed_analysis.csv (Per-chirp analysis)\n\n");
+                        resultBuilder.append("Use the EXPORT button to share these files.\n\n");
+                    }
+
+                    // Always show basic results too
+                    resultBuilder.append("Echo Detection Results:\n\n");
+                    resultBuilder.append(String.format(
                             "Echo Detection: %s\n" +
                                     "Signal Quality: %s\n" +
                                     "Signal Energy: %.2f\n" +
@@ -168,11 +251,12 @@ public class EchoTestActivity extends AppCompatActivity {
                             result.minValue,
                             result.maxValue,
                             result.meanValue,
-                            result.rmsValue);
+                            result.rmsValue));
 
-                    resultText.setText(resultStr);
+                    resultText.setText(resultBuilder.toString());
+                    resultScrollView.fullScroll(View.FOCUS_UP); // Scroll to top
+
                     testButton.setText("Start Test");
-                    autoTestButton.setEnabled(true);
                     isRunningTest = false;
                 });
             }
@@ -183,146 +267,76 @@ public class EchoTestActivity extends AppCompatActivity {
                     progressBar.setVisibility(View.INVISIBLE);
                     statusText.setText("Test failed: " + errorMessage);
                     testButton.setText("Start Test");
-                    autoTestButton.setEnabled(true);
                     isRunningTest = false;
                 });
             }
         });
     }
 
-    private void startAutoTest() {
-        if (!hasPermissions()) {
-            requestPermissions();
-            return;
-        }
-
-        isRunningAutoTest = true;
-        currentAutoTestNumber = 0;
-        autoTestResults.clear();
-        resultsBuilder = new StringBuilder();
-
-        // Add timestamp header to results
-        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
-        String timestamp = sdf.format(new Date());
-        resultsBuilder.append("AUTO TEST SESSION - ").append(timestamp).append("\n\n");
-
-        resultText.setText(resultsBuilder.toString());
-        autoTestButton.setText("Stop Auto Test");
-        testButton.setEnabled(false);
-
-        runNextAutoTest();
-    }
-
-    private void runNextAutoTest() {
-        if (!isRunningAutoTest || currentAutoTestNumber >= AUTO_TEST_COUNT) {
-            finishAutoTest();
-            return;
-        }
-
-        currentAutoTestNumber++;
-        statusText.setText("Auto Test: Running test " + currentAutoTestNumber + " of " + AUTO_TEST_COUNT);
-        progressBar.setVisibility(View.VISIBLE);
-        progressBar.setProgress(0);
-
-        // Start individual test
-        echoTester.startTest(new EchoTester.EchoTestCallback() {
-            @Override
-            public void onProgress(int percentComplete) {
-                mainHandler.post(() -> {
-                    progressBar.setProgress(percentComplete);
-                    statusText.setText("Auto Test " + currentAutoTestNumber + "/" +
-                            AUTO_TEST_COUNT + ": " + percentComplete + "% complete");
-                });
-            }
-
-            @Override
-            public void onTestComplete(EchoTester.TestResult result) {
-                mainHandler.post(() -> {
-                    // Add this result to our collection
-                    autoTestResults.add(result);
-
-                    // Append individual result to the results text
-                    resultsBuilder.append("TEST #").append(currentAutoTestNumber).append(":\n");
-                    resultsBuilder.append("Echo: ").append(result.echoDetected ? "YES" : "NO")
-                            .append(" | Quality: ").append(result.signalQuality)
-                            .append(" | SNR: ").append(String.format("%.2f dB", result.snr))
-                            .append(" | Energy: ").append(String.format("%.2f", result.signalEnergy))
-                            .append("\n\n");
-
-                    resultText.setText(resultsBuilder.toString());
-
-                    // Wait a moment before starting the next test
-                    mainHandler.postDelayed(() -> runNextAutoTest(), 3000);
-                });
-            }
-
-            @Override
-            public void onError(String errorMessage) {
-                mainHandler.post(() -> {
-                    resultsBuilder.append("TEST #").append(currentAutoTestNumber)
-                            .append(" ERROR: ").append(errorMessage).append("\n\n");
-                    resultText.setText(resultsBuilder.toString());
-
-                    // Continue with next test despite error
-                    mainHandler.postDelayed(() -> runNextAutoTest(), 500);
-                });
-            }
-        });
-    }
-
-    private void finishAutoTest() {
-        isRunningAutoTest = false;
-        progressBar.setVisibility(View.INVISIBLE);
-        autoTestButton.setText("Auto Test (10x)");
-        testButton.setEnabled(true);
-
-        if (autoTestResults.isEmpty()) {
-            statusText.setText("Auto test completed with no results");
-            return;
-        }
-
-        // Calculate stats from all tests
-        int echoCount = 0;
-        double totalSnr = 0;
-        double totalEnergy = 0;
-
-        for (EchoTester.TestResult result : autoTestResults) {
-            if (result.echoDetected) {
-                echoCount++;
-            }
-            totalSnr += result.snr;
-            totalEnergy += result.signalEnergy;
-        }
-
-        double echoRate = (double) echoCount / autoTestResults.size() * 100;
-        double avgSnr = totalSnr / autoTestResults.size();
-        double avgEnergy = totalEnergy / autoTestResults.size();
-
-        // Add summary to results
-        resultsBuilder.append("===== AUTO TEST SUMMARY =====\n");
-        resultsBuilder.append(String.format("Tests Run: %d\n", autoTestResults.size()));
-        resultsBuilder.append(String.format("Echo Detection Rate: %.1f%% (%d/%d)\n",
-                echoRate, echoCount, autoTestResults.size()));
-        resultsBuilder.append(String.format("Average SNR: %.2f dB\n", avgSnr));
-        resultsBuilder.append(String.format("Average Signal Energy: %.2f\n", avgEnergy));
-
-        resultText.setText(resultsBuilder.toString());
-        statusText.setText("Auto test completed: " + echoCount + "/" + autoTestResults.size() + " echoes detected");
-    }
-
     private void stopTest() {
         echoTester.stopTest();
         statusText.setText("Test stopped");
         testButton.setText("Start Test");
-        autoTestButton.setEnabled(true);
         progressBar.setVisibility(View.INVISIBLE);
         isRunningTest = false;
     }
 
-    private void stopAutoTest() {
-        isRunningAutoTest = false;
-        echoTester.stopTest();
-        finishAutoTest();
+    // In your EchoTestActivity.java, update the export method:
+
+    private void exportLastSession() {
+        if (lastSessionPath == null) {
+            Toast.makeText(this, "No test data available to export", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // Get the directory
+        File sessionDir = new File(lastSessionPath);
+        if (!sessionDir.exists() || !sessionDir.isDirectory()) {
+            Toast.makeText(this, "Session directory not found", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // Use a file chooser to let the user select where to save or share the files
+        Intent shareIntent = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        shareIntent.setType("*/*");
+
+        ArrayList<Uri> files = new ArrayList<>();
+        File[] fileList = sessionDir.listFiles();
+
+        if (fileList != null) {
+            for (File file : fileList) {
+                try {
+                    // Use FileProvider for secure sharing
+                    Uri uri = FileProvider.getUriForFile(
+                            this,
+                            getApplicationContext().getPackageName() + ".provider",
+                            file);
+                    files.add(uri);
+                    Log.d(TAG, "Added file to share: " + file.getName() + " with URI: " + uri);
+                } catch (Exception e) {
+                    Log.e(TAG, "Error sharing file: " + file.getName(), e);
+                }
+            }
+        }
+
+        if (files.isEmpty()) {
+            Toast.makeText(this, "No files found to export", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        shareIntent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, files);
+        shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+        // Create a chooser for sharing
+        String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        String shareTitle = "Share Echo Test Data - " + timeStamp;
+
+        try {
+            startActivity(Intent.createChooser(shareIntent, shareTitle));
+        } catch (Exception e) {
+            Log.e(TAG, "Error launching share intent", e);
+            Toast.makeText(this, "Error sharing files: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
     }
 
     @Override
